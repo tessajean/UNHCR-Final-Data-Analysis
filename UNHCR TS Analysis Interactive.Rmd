@@ -1,0 +1,305 @@
+---
+title: "UNHCR Time Series Analysis and Asylum Seeker Forecasting"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+  always_allow_html: yes
+---
+```{r global_options, include=FALSE}
+knitr::opts_chunk$set(error = FALSE, warning = FALSE, cache = TRUE, message=FALSE)
+```
+
+#1.1 Prepare Dataset for Analysis
+```{r setup, include = FALSE}
+library(xml2)
+library(dplyr)
+
+#plots
+library(devtools)
+library(ggplot2)
+library(plotly)
+library(reshape2)
+library(textreg)
+
+#time series
+library(dynlm)
+library(urca)
+library(tseries)
+
+#forecasting
+library(forecast)
+library(scales)
+
+#knitting
+library(knitr)
+library(rvest)
+```
+
+##1.2 Import Data
+Install packages and load libraries, set working directory
+```{r results='hide', warning=FALSE, message=FALSE}
+setwd("/Users/tessaschneider/Desktop/Final Data Analysis")
+
+df <- read.csv("unhcr_popstats_refugee-status.csv", skip = 2, stringsAsFactors = F, na.string=c("", "*"))
+df2 <- read.csv("unhcr_popstats_export_persons_of_concern_all_data.csv", skip = 3, stringsAsFactors = F, na.string=c("", "*"))
+```
+
+##1.3 Tidy Data
+Convert Total.Population to numeric before merging the datasets (after merging, data before 2000 drops out)
+```{r warning=FALSE, message=FALSE}
+df2$Total.Population[df2$Total.Population=="*"] <- "2.5"
+df2$Total.Population <- as.numeric(df2$Total.Population)
+
+merged_data <- merge(df2, df, by = c("Year", "Country...territory.of.asylum.residence", "Origin"))
+
+table(merged_data$Year)
+```
+
+##2.1 Exploring Data: Top Destination Countries
+
+```{r, warning=FALSE, message=FALSE}
+destination_country_total <- merged_data %>%
+  group_by(Country...territory.of.asylum.residence, Year) %>%
+  summarise(Total = sum(Total.Population))
+
+top_destcountries <- destination_country_total %>%
+  group_by(Country...territory.of.asylum.residence) %>%
+  summarise(Total = sum(Total, na.rm = TRUE)) %>%
+  top_n(20)
+
+top_destcountries2 <- as.character(top_destcountries$Country...territory.of.asylum.residence)
+
+plot1 <- destination_country_total %>%
+  filter(Country...territory.of.asylum.residence %in% top_destcountries2) %>%
+  ggplot(mapping = aes(x = Year, y = Total)) +
+  geom_line() + coord_cartesian(ylim = c(0, 3e6)) +
+  facet_wrap( ~ Country...territory.of.asylum.residence, ncol=4)
+
+ggplotly(plot1)
+```
+
+##2.2 Exploring Data: Top Origin Countries
+
+```{r warning=FALSE, message=FALSE}
+origin_country_total <- merged_data %>%
+  group_by(Origin, Year) %>%
+  summarise(Total = sum(Total.Population))
+  
+top_origcountries <- origin_country_total %>%
+  group_by(Origin) %>%
+  summarise(Total = sum(Total, na.rm = TRUE)) %>%
+  top_n(20)
+
+top_origcountries2 <- as.character(top_origcountries$Origin)
+
+plot2 <- origin_country_total %>%
+  filter(Origin %in% top_origcountries2) %>%
+  ggplot(mapping = aes(x = Year, y = Total)) +
+  geom_line() + coord_cartesian(ylim = c(0, 1e7)) +
+  facet_wrap( ~ Origin, ncol=4)
+
+ggplotly(plot2)
+
+table(merged_data$Year)
+```
+
+##2.3 Exploring Data: Percent Change in Total Population
+By "People of Concern"", subset for only PoC category counts by year
+change value from character to integer
+```{r warning=FALSE, message=FALSE}
+Year_Pop <- aggregate(merged_data$`Total.Population`, by=list(Year = merged_data$Year), FUN=sum, na.rm = TRUE)
+
+Year_Pop$rate <- NA
+
+Year_Pop$rate[which(Year_Pop$Year>2000)] = 100*(diff(Year_Pop$x)/Year_Pop[-nrow(Year_Pop),]$x)
+
+plot3 <- ggplot(Year_Pop, aes(x= Year, y= rate)) + geom_line() + 
+  labs(title="Percent Change in People of Concern",
+       subtitle="(2000 - 2016)",
+       x="Year", 
+       y="Percent Change")
+
+ggplotly(plot3)
+
+PoC_count <- merged_data[c(1,4:10)]
+
+PoC_count <- melt(PoC_count, id=c("Year"))
+
+str(PoC_count)
+
+PoC_count$value <- as.integer(PoC_count$value)
+```
+Starting from 2013 the number of refugees has increased dramatically and with it pending cases for asylum seekers have also increased
+```{r}
+plot4 <- ggplot(PoC_count,aes(Year,value, na.rm = TRUE)) +
+  geom_bar(aes(fill=variable),stat="identity") +
+  labs(title="UNHCR Population Statistics Database",
+       subtitle="(2000 - 2016)",
+       x="Year", 
+       y="Number of People (Millions)")
+ggplotly(plot4)
+```
+
+##3.1 Time Series Analysis: Preparation
+* y is PoC in Germany
+* x is PoC in all countries in database
+* t is Years (2000-2016)
+
+All variables used in the model must be declared as time series
+```{r warning=FALSE, message=FALSE}
+Germany_PoC <- merged_data %>% group_by(Country...territory.of.asylum.residence, Year) %>% 
+  filter('Germany' %in% Country...territory.of.asylum.residence) %>% 
+  summarise(Total = sum(Total.Population, na.rm = TRUE))
+
+Germany_data <- merge(Germany_PoC, Year_Pop, by = "Year")
+
+Germany_data$Year <- ts(Germany_data$Year)
+Germany_data$Total <- ts(Germany_data$Total)
+Germany_data$x <- ts(Germany_data$x)
+```
+
+##3.2 Time Series Analysis: Test for Time Series Problems
+###Test for Persistence or Dependence
+Row is <1 so it meets the stability condition for weak dependency
+```{r warning=FALSE, message=FALSE}
+summary(dynlm(Total ~ L(Total, 1), data = Germany_data))
+```
+###Test for Persistence or Dependence
+Germany's Total persons of concern annual data shows that the correlation of lags of the Total Population variable drops to zero after 1 lag with statistical insignificant correlation after 1 lag, therefore it is not persistent
+```{r}
+acf(Germany_data$Total, na.action = na.pass, lag.max = 5)
+```
+
+###Tests for Stationarity
+Germany Total PoC annual is trending after 2012
+Stochastic trend (increases and decreases inconsistently) in the Germany Total plot Deterministic trend (increases and decreases consistently) in the Germany x plot
+```{r}
+ggplot(data=Germany_data,
+       mapping = aes(x = Year, y = Total)) + geom_line()
+
+par(mfrow = c(1,2))
+plot(Germany_data$Total)
+plot(Germany_data$x)
+```
+
+###Tests for Stationarity - Unit Root Test - Dickey Fuller Test 
+(p value <.05 then there is no unit root)
+```{r}
+adf.test(Germany_data$Total)
+```
+
+###Detrend: When there is a Deterministic Trend
+Regress y, x1 and x2 on trend term(Year) and intercept, save residuals for y, x1 and x2, and then regress y residual on x1 residual and x2 residual
+The regression with residuals shows an increase in the correlation, but it is still not statistically significant
+Even after detrending there is still no statistically significant coefficient
+```{r}
+fit = lm(Germany_data$Total ~ Germany_data$Year, na.action = NULL)
+plot(resid(fit), type="o", main="Detrended")
+
+fit1 <- lm(Germany_data$Total ~ Germany_data$Year)
+res_Germany_dataTotal <- residuals(fit1)
+
+fit2 <- lm(Germany_data$x ~ Germany_data$Year)
+res_Germany_datax <- residuals(fit2)
+
+summary(m3 <- dynlm(res_Germany_dataTotal ~ res_Germany_datax))
+```
+
+###Detrend: When there is a Stochastic Trend
+First differencing then plotting shows that the trend was removed in this case
+```{r}
+diff_Germany_dataTotal <- c(NA, diff(Germany_data$Total))
+diff_Germany_datax <- c(NA, diff(Germany_data$x))
+
+par(mfrow = c(1,2))
+plot(diff_Germany_dataTotal)
+plot(diff_Germany_datax)
+```
+
+##3.3 Run OLS regression
+This time series regression resulted in no statistically significant correlation between the selected variables
+Since there is monthly data on asylum seekers, perhaps it is possible to predict future numbers of asylum seekers in Germany through a forecasting model
+(there are clear limitations in only looking at one variable, so these predictions cannot be interpreted as exact predictions)
+```{r warning=FALSE, message=FALSE}
+summary(m1 <- dynlm(Germany_data$Total ~ Germany_data$x, Germany_data$Year))
+summary(m2 <- dynlm(diff_Germany_dataTotal ~ diff_Germany_datax))
+```
+
+##4.1 Forecasting Number of Future Asylum Seekers in Germany: Preparation
+As before, we convert values to numeric, create an object that sums all origin countries to Germany by month, declare variables as time series variables
+```{r warning=FALSE, message=FALSE}
+df3 <- read.csv("unhcr_popstats_export_asylum_seekers_monthly_2017_12_04_203715.csv", skip = 2, stringsAsFactors = F)
+
+df3$Value[df3$Value=="*"] <- "0"
+df3$Value <- as.numeric(df3$Value)
+
+Germany_monthlyasylum_total <- df3 %>%
+  group_by(Country...territory.of.asylum.residence, Year, Month) %>%
+  summarise(Total = sum(Value))
+
+Germany_monthly <- ts(Germany_monthlyasylum_total$Total, 
+                      start = c(1999, 1), frequency = 12)
+```
+##4.2 Forecasting Number of Future Asylum Seekers in Germany: Test for Time Series Problems
+###Stationarity Test
+Plot and observe trends
+```{r}
+autoplot(as.zoo(Germany_monthly), geom = "line")
+```
+
+###Persistence Test 1
+After dynlm, row is <1 so it meets the stability condition for weak dependency)
+```{r}
+summary(dynlm(Germany_monthly ~ L(Germany_monthly, 1)))
+```
+
+###Persistence Test 2
+After acf, Germany monthly's correlation of lags drops to zero after 2.5 lags therefore it is not persistent
+```{r}
+acf(Germany_monthly, na.action = na.pass, lag.max = 40)
+```
+
+###Persistence Test 3
+After Dickey Fuller Test for Unit Root, p value is <.05 then there is no unit root)
+```{r}
+adf.test(Germany_monthly)
+```
+
+##4.3 Forecasting Number of Future Asylum Seekers in Germany
+###Decompose
+Then we can decompose the additives of time series.  This returns estimates of the seasonal component, trend component and irregular components or "random"
+```{r}
+plot(decompose(Germany_monthly))
+```
+
+##4.4 Forecasting Number of Future Asylum Seekers in Germany
+###Seasonal Changes
+To look more closely at the seasonal changes in the number of asylum seekers we use the "stl" function
+Germany has had a positive net flow of asylum seekers in June, July, November, December and the highest typically in February between 2000 and 2015
+```{r}
+stl(Germany_monthly, s.window="periodic")
+```
+
+##4.5 Forecasting Number of Future Asylum Seekers in Germany
+The ARIMA forecasting method shows possible future changes in the number of asylum seekers in Germany in the next years
+The wide confidence intervals show the uncertainty in forecasting with the dark grey representing 95 percent confidence and the light grey representing 80 percent confidence
+```{r}
+plot(forecast(auto.arima(Germany_monthly), 30), main = "ARIMA Forecast: Germany Asylum Seeker Arrivals", ylab = "Number of Asylum Seekers", xlab = "Year", ylim=c(0, 90000))
+```
+
+###ARIMA Forecast Values
+```{r}
+forecast(auto.arima(Germany_monthly), 24)
+```
+
+The TBATS forecasting method shows another possible future change in the number of asylum seekers in Germany in the next years
+```{r}
+plot(forecast(tbats(Germany_monthly), 30), main = "TBATS Forecast: Germany Asylum Seeker Arrivals", ylab = "Number of Asylum Seekers", xlab = "Year", ylim=c(0, 90000))
+```
+
+###TBATS Forecast Values
+```{r}
+forecast(tbats(Germany_monthly), 24)
+```
+
